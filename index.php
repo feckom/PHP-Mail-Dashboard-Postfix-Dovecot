@@ -453,6 +453,36 @@ function healthInfo(): array {
     ];
 }
 
+/* -------- NEW: Top Senders / Recipients -------- */
+function collectTopTalkers(int $sinceTs, int $limit = 10): array {
+    $lines = linesForRange($sinceTs, time());
+    $senders = [];
+    $recipients = [];
+
+    foreach ($lines as $line) {
+        // Find sender
+        if (preg_match('/from=<([^>]+)>/i', $line, $matches)) {
+            $sender = strtolower($matches[1]);
+            if ($sender) $senders[$sender] = ($senders[$sender] ?? 0) + 1;
+        }
+        // Find recipient for successfully sent messages
+        if (preg_match('/to=<([^>]+)>.+status=sent/i', $line, $matches)) {
+            $recipient = strtolower($matches[1]);
+            if ($recipient) $recipients[$recipient] = ($recipients[$recipient] ?? 0) + 1;
+        }
+    }
+    
+    arsort($senders);
+    arsort($recipients);
+
+    return [
+        'senders' => array_slice($senders, 0, $limit, true),
+        'recipients' => array_slice($recipients, 0, $limit, true)
+    ];
+}
+
+
+/* -------- API router -------- */
 if (isset($_GET['api'])) {
     try {
         switch ($_GET['api']) {
@@ -468,6 +498,10 @@ if (isset($_GET['api'])) {
             case 'series_today':  jsonOut(seriesToday());
             case 'series_week':   jsonOut(seriesWeek());
             case 'series_month':  jsonOut(seriesMonth());
+            // NEW API Endpoints
+            case 'top_day':       jsonOut(collectTopTalkers((new DateTime('today'))->getTimestamp()));
+            case 'top_week':      jsonOut(collectTopTalkers((new DateTime('-6 days'))->setTime(0,0)->getTimestamp()));
+            case 'top_month':     jsonOut(collectTopTalkers((new DateTime('-29 days'))->setTime(0,0)->getTimestamp()));
             default:              jsonOut(['error'=>'unknown_api']);
         }
     } catch (Throwable $e) {
@@ -513,13 +547,22 @@ canvas{width:100%;max-height:220px}
 .refresh{color:var(--muted);font-size:10px}
 ul.mini{margin:6px 0 0 14px;padding:0;line-height:1.3}
 ul.mini li{margin-bottom:2px;color:#9aa6b2}
+/* NEW STYLES for tables */
+.table-container{display:flex;gap:var(--grid-gap);margin-top:10px}
+.table-wrapper{flex:1;min-width:0}
+.table-wrapper h3{font-size:11px;margin:0 0 4px;color:var(--muted)}
+table.mini-table{width:100%;border-collapse:collapse;font-size:10px}
+table.mini-table th,table.mini-table td{padding:4px 6px;text-align:left;border-bottom:1px solid #1b2230}
+table.mini-table th{font-weight:normal;color:var(--muted)}
+table.mini-table td:last-child{text-align:right;font-weight:700}
+table.mini-table tr:last-child td{border-bottom:0}
 </style>
 <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
 </head>
 <body>
 <header>
   <h1>📫 Mail Dashboard <small>· Extended · Postfix &amp; Dovecot</small></h1>
-  <div class="refresh">KPIs: <code>5s</code> · Charts: <code>30s</code></div>
+  <div class="refresh">KPIs: <code>5s</code> · Charts: <code>30s</code> · Tables: <code>60s</code></div>
 </header>
 
 <div class="grid">
@@ -620,6 +663,47 @@ ul.mini li{margin-bottom:2px;color:#9aa6b2}
     <div class="row"><small>Note:</small><code id="diag-note">–</code></div>
     <ul class="mini" id="diag-warn"></ul>
   </div>
+
+  <div class="card" style="grid-column: span 2;">
+      <h2>📊 Top Senders & Recipients (Today)</h2>
+      <div class="table-container">
+          <div class="table-wrapper">
+              <h3>Top Senders</h3>
+              <table class="mini-table"><thead><tr><th>Email</th><th>Count</th></tr></thead><tbody id="top-senders-day"></tbody></table>
+          </div>
+          <div class="table-wrapper">
+              <h3>Top Recipients</h3>
+              <table class="mini-table"><thead><tr><th>Email</th><th>Count</th></tr></thead><tbody id="top-recipients-day"></tbody></table>
+          </div>
+      </div>
+  </div>
+  <div class="card" style="grid-column: span 2;">
+      <h2>📅 Top Senders & Recipients (Week)</h2>
+      <div class="table-container">
+          <div class="table-wrapper">
+              <h3>Top Senders</h3>
+              <table class="mini-table"><thead><tr><th>Email</th><th>Count</th></tr></thead><tbody id="top-senders-week"></tbody></table>
+          </div>
+          <div class="table-wrapper">
+              <h3>Top Recipients</h3>
+              <table class="mini-table"><thead><tr><th>Email</th><th>Count</th></tr></thead><tbody id="top-recipients-week"></tbody></table>
+          </div>
+      </div>
+  </div>
+  <div class="card" style="grid-column: span 2;">
+      <h2>📆 Top Senders & Recipients (Month)</h2>
+      <div class="table-container">
+          <div class="table-wrapper">
+              <h3>Top Senders</h3>
+              <table class="mini-table"><thead><tr><th>Email</th><th>Count</th></tr></thead><tbody id="top-senders-month"></tbody></table>
+          </div>
+          <div class="table-wrapper">
+              <h3>Top Recipients</h3>
+              <table class="mini-table"><thead><tr><th>Email</th><th>Count</th></tr></thead><tbody id="top-recipients-month"></tbody></table>
+          </div>
+      </div>
+  </div>
+
 </div>
 
 <div class="footer">Updated: <span id="updated">–</span> · <a href="?api=health" target="_blank" style="color:#4cc9f0">health</a> · <a href="?api=source" target="_blank" style="color:#4cc9f0">source</a></div>
@@ -801,12 +885,55 @@ async function refreshCharts(){
   }catch(e){ console.error(e); }
 }
 
+// NEW FUNCTION to refresh top talkers tables
+async function refreshTopTalkers() {
+    try {
+        const [day, week, month] = await Promise.all([
+            j('top_day'), j('top_week'), j('top_month')
+        ]);
+
+        const populateTable = (tbodyId, data) => {
+            const tbody = $(tbodyId);
+            tbody.innerHTML = '';
+            if (Object.keys(data).length === 0) {
+                tbody.innerHTML = '<tr><td colspan="2" style="text-align:center;color:var(--muted);">No data</td></tr>';
+                return;
+            }
+            for (const [email, count] of Object.entries(data)) {
+                const tr = document.createElement('tr');
+                const tdEmail = document.createElement('td');
+                tdEmail.textContent = email;
+                const tdCount = document.createElement('td');
+                tdCount.textContent = count;
+                tr.appendChild(tdEmail);
+                tr.appendChild(tdCount);
+                tbody.appendChild(tr);
+            }
+        };
+
+        populateTable('top-senders-day', day.senders);
+        populateTable('top-recipients-day', day.recipients);
+
+        populateTable('top-senders-week', week.senders);
+        populateTable('top-recipients-week', week.recipients);
+
+        populateTable('top-senders-month', month.senders);
+        populateTable('top-recipients-month', month.recipients);
+
+    } catch(e) { console.error('Error refreshing top talkers:', e); }
+}
+
+// Initial calls
 refreshHealth();
 refreshKPIs();
 refreshCharts();
+refreshTopTalkers(); // New initial call
+
+// Intervals
 setInterval(refreshHealth, 15000);
 setInterval(refreshKPIs, 5000);
 setInterval(refreshCharts, 30000);
+setInterval(refreshTopTalkers, 60000); // New interval, e.g. every minute
 </script>
 </body>
 </html>
