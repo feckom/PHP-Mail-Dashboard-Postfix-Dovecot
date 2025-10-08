@@ -2,12 +2,25 @@
 declare(strict_types=1);
 mb_internal_encoding('UTF-8');
 
+/* -------- Main Configuration -------- */
+const CONFIG = [
+    'thresholds' => [
+        'auth_fail_warn'      => 50,
+        'auth_fail_attack'    => 300,
+        'queue_warn'          => 20,
+        'queue_high'          => 200,
+        'stale_log_minutes'   => 15,
+    ]
+];
+
+/* -------- Paths / Cache -------- */
 const CACHE_DIR      = __DIR__ . '/.cache';
 const CACHE_LOGSRC   = CACHE_DIR . '/logsource.json';
 const CACHE_INDEX    = CACHE_DIR . '/index.json';
 const CACHE_AGG      = CACHE_DIR . '/agg.json';
 const CACHE_HEALTH   = CACHE_DIR . '/health.json';
 
+/* -------- Binaries -------- */
 const BIN_POSTQUEUE  = '/usr/sbin/postqueue';
 const BIN_DOVEADM    = '/usr/bin/doveadm';
 const BIN_SS         = '/usr/bin/ss';
@@ -19,12 +32,12 @@ const BIN_UPTIME     = '/usr/bin/uptime';
 const BIN_HOSTCTL    = '/usr/bin/hostnamectl';
 const BIN_JOURNALCTL = '/usr/bin/journalctl';
 
+/* -------- Log Discovery -------- */
 const LOG_CANDIDATES = [
     '/var/log/mail.log*',
     '/var/log/maillog*',
     '/var/log/mail/*.log*',
 ];
-
 const DETECT_REFRESH_SEC = 3600;
 const SCAN_TIMEOUT       = 15;
 const JOURNAL_UNITS      = ['postfix', 'dovecot'];
@@ -85,13 +98,16 @@ function parseLogTimestamp(string $line, ?int $assumedYear = null): ?int {
     return null;
 }
 
+// ENHANCED: Added greylisted and rbl_reject types
 function detectType(string $line): ?string {
     if (preg_match('/\bstatus=sent\b/i', $line)) return 'sent';
     if (preg_match('/postfix\/(local|virtual|pipe).*status=sent/i', $line)) return 'sent';
     if (preg_match('/dovecot-lda.*saved mail to/i', $line)) return 'sent';
     if (preg_match('/\bstatus=(deferred|bounced)\b/i', $line)) return 'failed_delivery';
     if (preg_match('/postfix\/smtpd.*client=|postfix\/cleanup|qmgr:.*\bfrom=/i', $line)) return 'incoming';
-    if (preg_match('/NOQUEUE:\s*reject|[\s]reject(\b|:)|blocked|policy|blacklist|RBL|greylist(ed)?/i', $line)) return 'rejected';
+    if (preg_match('/greylist(ed)?/i', $line)) return 'greylisted';
+    if (preg_match('/RBL|blacklist/i', $line)) return 'rbl_reject';
+    if (preg_match('/NOQUEUE:\s*reject|[\s]reject(\b|:)|blocked|policy/i', $line)) return 'rejected';
     if (preg_match('/(amavis|rspamd|clamd|clamav).*(reject|discard|virus|malware|spam)|\b(spam|virus)\s+(reject|discard|found)\b/i', $line)) return 'spam_virus';
     if (preg_match('/quota|mail(box)?\s*full|exceed(ed)?\s*storage/i', $line)) return 'quota_fail';
     if (preg_match('/SASL\s+(LOGIN|PLAIN)\s+authentication\s+failed|auth(entication)?\s+failed/i', $line)) return 'auth_fail';
@@ -116,39 +132,21 @@ function detectLogSource(bool $force = false): array {
     if (!$force && !empty($cached['source']['picked_at']) && ($now - (int)$cached['source']['picked_at'] < DETECT_REFRESH_SEC)) {
         return $cached;
     }
-
-    $pickedGlob = null;
-    $filesPicked = [];
-    $scanned = [];
-
+    $pickedGlob = null; $filesPicked = []; $scanned = [];
     foreach (LOG_CANDIDATES as $glob) {
         $files = listFilesForGlob($glob);
         $scanned[] = ['glob'=>$glob,'files'=>count($files)];
         if (!$filesPicked && $files) {
-            $pickedGlob = $glob;
-            $filesPicked = $files;
-            break;
+            $pickedGlob = $glob; $filesPicked = $files; break;
         }
     }
-
     if (!$pickedGlob) {
-        [$code, $out] = run([BIN_JOURNALCTL, '--no-pager', '-n', '50', ...array_map(fn($u)=>['-u',$u], JOURNAL_UNITS)]);
-        if ($code === 0) {
-            $pickedGlob = 'journal';
-            $filesPicked = [];
-        }
+        [$code] = run([BIN_JOURNALCTL, '--no-pager', '-n', '1', '-u', 'postfix']);
+        if ($code === 0) { $pickedGlob = 'journal'; $filesPicked = []; }
     }
-
     $src = [
-        'source'=>[
-            'glob'=>$pickedGlob,
-            'picked_at'=>$now,
-            'scanned'=>$scanned,
-            'server_tz'=>serverTZ(),
-        ],
-        'readable_files'=>$filesPicked,
-        'bins_present'=>binsPresent(),
-        'server_tz'=>serverTZ(),
+        'source'=>['glob'=>$pickedGlob, 'picked_at'=>$now, 'scanned'=>$scanned, 'server_tz'=>serverTZ()],
+        'readable_files'=>$filesPicked, 'bins_present'=>binsPresent(), 'server_tz'=>serverTZ(),
         'index_meta'=>readJson(CACHE_INDEX, ['files'=>0,'updated'=>0]),
         'agg_ts'=> (int) (readJson(CACHE_AGG, [])['updated_at'] ?? 0),
     ];
@@ -174,22 +172,17 @@ function statusRegex(): string {
     return '(status=sent|status=(deferred|bounced)|NOQUEUE:\s*reject|[\s]reject(\b|:)|blocked|policy|blacklist|RBL|greylist(ed)?|(amavis|rspamd|clamd|clamav)|(spam|virus)\s+(reject|discard|found)|postfix\/smtpd|postfix\/cleanup|qmgr:.*from=|dovecot-lda.*saved mail to|quota|mail(box)?\s*full|SASL\s+(LOGIN|PLAIN)\s+authentication\s+failed|auth(entication)?\s+failed)';
 }
 function readRelevantFromPlain(string $file, int $sinceTs = 0): array {
-    $rx = '~' . statusRegex() . '~i';
-    $out = [];
+    $rx = '~' . statusRegex() . '~i'; $out = [];
     $assumedYear = (int)date('Y', @filemtime($file) ?: time());
-    $fh = @fopen($file, 'rb');
-    if (!$fh) return $out;
+    $fh = @fopen($file, 'rb'); if (!$fh) return $out;
     while (!feof($fh)) {
-        $line = fgets($fh);
-        if ($line === false) break;
+        $line = fgets($fh); if ($line === false) break;
         if (!preg_match($rx, $line)) continue;
-        $ts = parseLogTimestamp($line, $assumedYear);
-        if ($ts === null) continue;
+        $ts = parseLogTimestamp($line, $assumedYear); if ($ts === null) continue;
         if ($sinceTs > 0 && $ts < $sinceTs) continue;
         $out[] = $line;
     }
-    fclose($fh);
-    return $out;
+    fclose($fh); return $out;
 }
 function zgrepRelevant(array $files): array {
     if (empty($files)) return [];
@@ -198,19 +191,14 @@ function zgrepRelevant(array $files): array {
     if ($out === '' || $out === null) return [];
     return explode("\n", trim($out));
 }
-
 function journalRelevant(int $sinceTs = 0): array {
     $args = [BIN_JOURNALCTL,'--no-pager','-n','20000'];
     foreach (JOURNAL_UNITS as $u) { $args[]='-u'; $args[]=$u; }
-    [, $out] = run($args, 10);
-    if (!$out) return [];
-    $rx = '~' . statusRegex() . '~i';
-    $lines = [];
-    $y = (int)date('Y');
+    [, $out] = run($args, 10); if (!$out) return [];
+    $rx = '~' . statusRegex() . '~i'; $lines = []; $y = (int)date('Y');
     foreach (explode("\n", $out) as $ln) {
         if (!preg_match($rx, $ln)) continue;
-        $ts = parseLogTimestamp($ln, $y);
-        if ($ts === null) continue;
+        $ts = parseLogTimestamp($ln, $y); if ($ts === null) continue;
         if ($sinceTs > 0 && $ts < $sinceTs) continue;
         $lines[] = $ln;
     }
@@ -219,28 +207,19 @@ function journalRelevant(int $sinceTs = 0): array {
 
 function collectTodayStats(): array {
     $dt = new DateTimeImmutable('now');
-    $dateClassic = $dt->format('M j');
-    $dateIso     = $dt->format('Y-m-d');
-
-    $plain = activePlainFile();
-    $lines = [];
+    $dateClassic = $dt->format('M j'); $dateIso = $dt->format('Y-m-d');
+    $plain = activePlainFile(); $lines = [];
     if ($plain && is_readable($plain)) {
-        $todayStart = (new DateTimeImmutable('today'))->getTimestamp();
-        $lines = readRelevantFromPlain($plain, $todayStart);
+        $lines = readRelevantFromPlain($plain, (new DateTimeImmutable('today'))->getTimestamp());
     } else {
         $files = currentFiles();
-        if ($files) $lines = zgrepRelevant($files);
-        else        $lines = journalRelevant((new DateTimeImmutable('today'))->getTimestamp());
+        $lines = $files ? zgrepRelevant($files) : journalRelevant((new DateTimeImmutable('today'))->getTimestamp());
     }
-
-    $stats = ['date'=>$dateClassic, 'incoming'=>0,'sent'=>0,'failed_delivery'=>0,'rejected'=>0,'spam_virus'=>0,'quota_fail'=>0,'auth_fail'=>0];
+    $stats = ['date'=>$dateClassic, 'incoming'=>0, 'sent'=>0, 'failed_delivery'=>0, 'rejected'=>0, 'greylisted'=>0, 'rbl_reject'=>0, 'spam_virus'=>0, 'quota_fail'=>0, 'auth_fail'=>0];
     foreach ($lines as $ln) {
         if ($ln === '') continue;
-        if (strpos($ln, $dateIso) !== 0 && strpos($ln, $dateClassic) !== 0) {
-            continue;
-        }
-        $t = detectType($ln);
-        if (!$t) continue;
+        if (strpos($ln, $dateIso) !== 0 && strpos($ln, $dateClassic) !== 0) continue;
+        $t = detectType($ln); if (!$t) continue;
         if (isset($stats[$t])) $stats[$t]++;
     }
     $tot = max(1, (int)$stats['incoming']);
@@ -370,7 +349,6 @@ function seriesWeek(): array {
     $dayEnds = $dayStarts;
     for ($i=0;$i<count($dayEnds)-1;$i++) $dayEnds[$i] = $dayStarts[$i+1]-1;
     $dayEnds[count($dayEnds)-1] = $now->setTime(23,59,59)->getTimestamp();
-
     $b = bucketSeries($labels);
     $lines = linesForRange($dayStarts[0], $dayEnds[count($dayEnds)-1]);
     $n = count($labels);
@@ -400,13 +378,9 @@ function seriesMonth(): array {
     $dayEnds=$dayStarts;
     for($i=0;$i<count($dayEnds)-1;$i++)$dayEnds[$i]=$dayStarts[$i+1]-1;
     $dayEnds[count($dayEnds)-1]=$now->setTime(23,59,59)->getTimestamp();
-
     $lines=linesForRange($dayStarts[0], $dayEnds[count($dayEnds)-1]);
     $n=count($labels);
-    $incoming=array_fill(0,$n,0);
-    $sent=array_fill(0,$n,0);
-    $failed=array_fill(0,$n,0);
-
+    $incoming=array_fill(0,$n,0); $sent=array_fill(0,$n,0); $failed=array_fill(0,$n,0);
     foreach($lines as $ln){
         if ($ln==='') continue;
         $ts=parseLogTimestamp($ln,$y);
@@ -424,69 +398,51 @@ function seriesMonth(): array {
     return ['labels'=>$labels,'incoming'=>$incoming,'sent'=>$sent,'failed'=>$failed];
 }
 
+/* -------- Health -------- */
 function healthInfo(): array {
     $src = detectLogSource(false);
     $plain = activePlainFile();
+    $lastLogUpdate = $plain ? @filemtime($plain) : 0;
     $canReadPlain = $plain && is_readable($plain);
     $bins = binsPresent();
-
-    $lastMin = time()-60;
-    $recent = 0;
+    $lastMin = time()-60; $recent = 0;
     if ($canReadPlain) $recent = count(readRelevantFromPlain($plain, $lastMin));
     elseif (!empty($src['readable_files'])) $recent = count(zgrepRelevant($src['readable_files']));
     else $recent = count(journalRelevant($lastMin));
-
     $warn = [];
     if (empty($src['readable_files']) && (($src['source']['glob'] ?? '')!=='journal')) $warn[]='no_readable_log_files';
     if (!$bins['zgrep']) $warn[]='zgrep_missing';
-
     return [
-        'source'=>$src['source'] ?? [],
-        'readable_files'=>$src['readable_files'] ?? [],
-        'bins_present'=>$bins,
-        'sudo_mode_used'=>true,
-        'server_tz'=>serverTZ(),
-        'active_plain'=>$plain,
-        'recent_60s_rows'=>$recent,
+        'source'=>$src['source'] ?? [], 'readable_files'=>$src['readable_files'] ?? [],
+        'bins_present'=>$bins, 'sudo_mode_used'=>true, 'server_tz'=>serverTZ(),
+        'active_plain'=>$plain, 'recent_60s_rows'=>$recent,
         'note'=> $canReadPlain ? 'using plain file for live/today' : (!empty($src['readable_files']) ? 'using zgrep over files' : 'journal fallback'),
-        'warnings'=> $warn,
+        'warnings'=> $warn, 'last_log_update_ts' => $lastLogUpdate,
     ];
 }
 
-/* -------- NEW: Top Senders / Recipients -------- */
 function collectTopTalkers(int $sinceTs, int $limit = 10): array {
     $lines = linesForRange($sinceTs, time());
-    $senders = [];
-    $recipients = [];
-
+    $senders = []; $recipients = [];
     foreach ($lines as $line) {
-        // Find sender
         if (preg_match('/from=<([^>]+)>/i', $line, $matches)) {
             $sender = strtolower($matches[1]);
             if ($sender) $senders[$sender] = ($senders[$sender] ?? 0) + 1;
         }
-        // Find recipient for successfully sent messages
         if (preg_match('/to=<([^>]+)>.+status=sent/i', $line, $matches)) {
             $recipient = strtolower($matches[1]);
             if ($recipient) $recipients[$recipient] = ($recipients[$recipient] ?? 0) + 1;
         }
     }
-    
-    arsort($senders);
-    arsort($recipients);
-
-    return [
-        'senders' => array_slice($senders, 0, $limit, true),
-        'recipients' => array_slice($recipients, 0, $limit, true)
-    ];
+    arsort($senders); arsort($recipients);
+    return ['senders' => array_slice($senders, 0, $limit, true), 'recipients' => array_slice($recipients, 0, $limit, true)];
 }
 
-
-/* -------- API router -------- */
 if (isset($_GET['api'])) {
     try {
         switch ($_GET['api']) {
             case 'ping':          jsonOut(['ok'=>true,'time'=>time()]);
+            case 'config':        jsonOut(CONFIG);
             case 'health':        jsonOut(healthInfo());
             case 'source':        jsonOut(detectLogSource(false));
             case 'today':         jsonOut(collectTodayStats());
@@ -498,7 +454,6 @@ if (isset($_GET['api'])) {
             case 'series_today':  jsonOut(seriesToday());
             case 'series_week':   jsonOut(seriesWeek());
             case 'series_month':  jsonOut(seriesMonth());
-            // NEW API Endpoints
             case 'top_day':       jsonOut(collectTopTalkers((new DateTime('today'))->getTimestamp()));
             case 'top_week':      jsonOut(collectTopTalkers((new DateTime('-6 days'))->setTime(0,0)->getTimestamp()));
             case 'top_month':     jsonOut(collectTopTalkers((new DateTime('-29 days'))->setTime(0,0)->getTimestamp()));
@@ -516,20 +471,51 @@ if (isset($_GET['api'])) {
 <meta charset="utf-8">
 <title>Mail Dashboard — Extended Stats</title>
 <meta name="viewport" content="width=device-width,initial-scale=1">
+
 <style>
-:root{--bg:#0a0d12;--panel:#0f1419;--accent:#4cc9f0;--ok:#16a34a;--warn:#f59e0b;--err:#ef4444;--muted:#8b95a5;--txt:#e6edf3;--grid-gap:12px}
-*{box-sizing:border-box} body{margin:0;font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial;background:var(--bg);color:var(--txt);font-size:13px}
-header{padding:10px 14px;background:#080a0e;border-bottom:1px solid #1b2230;display:flex;gap:10px;align-items:center;flex-wrap:wrap}
-h1{font-size:16px;margin:0}
+:root{
+  --bg:#0a0d12; --panel:#0f1419; --accent:#4cc9f0;
+  --ok:#16a34a; --warn:#f59e0b; --err:#ef4444;
+  --muted:#8b95a5; --txt:#e6edf3; --grid-gap:12px;
+  --border-color:#1b2230;
+
+  /* Dark theme: greys for tables & charts */
+  --table-bg:#1b222c; --table-header:#232a35; --table-row:#1e2530;
+  --table-row-alt:#222a35; --table-border:#2a3443;
+
+  --chart-bg:#1b222c;      /* chart area bg */
+  --chart-border:#2a3443;  /* canvas frame */
+  --chart-grid:#2a3443;    /* grid lines */
+  --chart-ticks:#a0a8b3;   /* axes labels */
+}
+body.light-theme{
+  --bg:#f0f2f5; --panel:#ffffff; --accent:#007bff;
+  --ok:#198754; --warn:#ffc107; --err:#dc3545;
+  --muted:#6c757d; --txt:#212529; --border-color:#dee2e6;
+
+  --table-bg:#ffffff; --table-header:#f5f7fa; --table-row:#ffffff;
+  --table-row-alt:#fafbfc; --table-border:#dee2e6;
+
+  --chart-bg:#ffffff; --chart-border:#dee2e6;
+  --chart-grid:#dee2e6; --chart-ticks:#212529;
+}
+*{box-sizing:border-box}
+body{margin:0;font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial;background:var(--bg);color:var(--txt);font-size:13px;transition:background-color .2s,color .2s}
+header{padding:10px 14px;background:#080a0e;border-bottom:1px solid var(--border-color);display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+body.light-theme header{background:#fff}
+h1{font-size:16px;margin:0;flex-grow:1}
 small{color:var(--muted)}
 .grid{display:grid;grid-template-columns:repeat(4,1fr);gap:var(--grid-gap);padding:12px}
 @media(max-width:1400px){.grid{grid-template-columns:repeat(3,1fr)}}
 @media(max-width:1000px){.grid{grid-template-columns:repeat(2,1fr)}}
 @media(max-width:640px){.grid{grid-template-columns:1fr}}
-.card{background:var(--panel);border:1px solid #1a1f29;border-radius:12px;padding:12px;box-shadow:0 2px 8px rgba(0,0,0,.25)}
-.card h2{font-size:12px;margin:0 0 6px;color:#9aa6b2;letter-spacing:.2px}
+.card{background:var(--panel);border:1px solid var(--border-color);border-radius:12px;padding:12px;box-shadow:0 2px 8px rgba(0,0,0,.25)}
+body.light-theme .card{box-shadow:0 2px 8px rgba(0,0,0,.08)}
+.card h2{font-size:12px;margin:0 0 6px;color:#9aa6b2}
+body.light-theme .card h2{color:var(--muted)}
 .kpis{display:flex;gap:6px;flex-wrap:wrap}
-.kpi{background:#0a0e14;padding:8px 10px;border-radius:8px;border:1px solid #1a1f29;min-width:64px;text-align:center}
+.kpi{background:#0a0e14;padding:8px 10px;border-radius:8px;border:1px solid var(--border-color);min-width:64px;text-align:center}
+body.light-theme .kpi{background:#f8f9fa}
 .kpi .v{font-size:16px;font-weight:700}
 .kpi .l{font-size:9px;color:var(--muted);margin-top:2px;text-transform:uppercase;letter-spacing:.3px}
 .row{display:flex;gap:8px;align-items:center;justify-content:space-between;margin:4px 0;font-size:11px}
@@ -537,53 +523,59 @@ small{color:var(--muted)}
 .badge.ok{background:rgba(22,163,74,.12);color:#9ae6b4;border-color:rgba(22,163,74,.35)}
 .badge.warn{background:rgba(245,158,11,.12);color:#ffd166;border-color:rgba(245,158,11,.35)}
 .badge.err{background:rgba(239,68,68,.12);color:#fecaca;border-color:rgba(239,68,68,.35)}
+body.light-theme .badge.ok{color:var(--ok);border-color:var(--ok);background:rgba(25,135,84,.1)}
+body.light-theme .badge.warn{color:var(--warn);border-color:var(--warn);background:rgba(255,193,7,.1)}
+body.light-theme .badge.err{color:var(--err);border-color:var(--err);background:rgba(220,53,69,.1)}
 .alertbar{display:flex;gap:12px}
-.alert{flex:1;background:#0e131a;border:1px solid #1b2230;border-radius:10px;padding:8px 10px;display:flex;align-items:center;justify-content:space-between}
+.alert{flex:1;background:#0e131a;border:1px solid var(--border-color);border-radius:10px;padding:8px 10px;display:flex;align-items:center;justify-content:space-between}
+body.light-theme .alert{background:#f8f9fa}
 .alert .title{font-weight:700}
-.alert .value{font-family:ui-monospace,monospace}
-.footer{color:var(--muted);font-size:10px;padding:8px 12px;text-align:right;border-top:1px solid #1b2230}
-code{background:#0a0e14;padding:2px 5px;border-radius:4px;border:1px solid #1a1f29;color:#d2d9e3;font-size:10px}
-canvas{width:100%;max-height:220px}
+.footer{color:var(--muted);font-size:10px;padding:8px 12px;text-align:right;border-top:1px solid var(--border-color)}
+code{background:#0a0e14;padding:2px 5px;border-radius:4px;border:1px solid var(--border-color);color:#d2d9e3;font-size:10px}
+body.light-theme code{background:#e9ecef;color:#212529}
+
+/* Chart canvases: grey bg in dark */
+canvas{width:100%;max-height:220px;background:var(--chart-bg);border:1px solid var(--chart-border);border-radius:10px}
+
 .refresh{color:var(--muted);font-size:10px}
 ul.mini{margin:6px 0 0 14px;padding:0;line-height:1.3}
 ul.mini li{margin-bottom:2px;color:#9aa6b2}
-/* NEW STYLES for tables */
+
+/* Tables */
 .table-container{display:flex;gap:var(--grid-gap);margin-top:10px}
-.table-wrapper{flex:1;min-width:0}
-.table-wrapper h3{font-size:11px;margin:0 0 4px;color:var(--muted)}
-table.mini-table{width:100%;border-collapse:collapse;font-size:10px}
-table.mini-table th,table.mini-table td{padding:4px 6px;text-align:left;border-bottom:1px solid #1b2230}
-table.mini-table th{font-weight:normal;color:var(--muted)}
-table.mini-table td:last-child{text-align:right;font-weight:700}
+.table-wrapper{flex:1;min-width:0;background:var(--table-bg);border:1px solid var(--table-border);border-radius:10px;padding:6px}
+.table-wrapper h3{font-size:11px;margin:0 0 6px;color:var(--muted)}
+table.mini-table{width:100%;border-collapse:separate;border-spacing:0;font-size:10px}
+table.mini-table thead th{background:var(--table-header);color:var(--muted);padding:6px 8px;text-align:left;border-bottom:1px solid var(--table-border)}
+table.mini-table tbody td{background:var(--table-row);color:var(--txt);padding:6px 8px;text-align:left;border-bottom:1px solid var(--table-border)}
+table.mini-table tbody tr:nth-child(even) td{background:var(--table-row-alt)}
 table.mini-table tr:last-child td{border-bottom:0}
+table.mini-table td:last-child{text-align:right;font-weight:700}
+
+#staleLogWarning{display:none;background:var(--err);color:#fff;font-weight:bold;padding:4px 8px;border-radius:5px;font-size:10px}
+#themeToggle{background:var(--panel);border:1px solid var(--border-color);color:var(--txt);border-radius:50%;width:24px;height:24px;cursor:pointer;padding:0;line-height:24px}
 </style>
+
 <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
 </head>
 <body>
 <header>
-  <h1>📫 Mail Dashboard <small>· Extended · Postfix &amp; Dovecot</small></h1>
+  <h1>📫 Mail Dashboard</h1>
   <div class="refresh">KPIs: <code>5s</code> · Charts: <code>30s</code> · Tables: <code>60s</code></div>
+  <label style="display:flex;align-items:center;gap:5px;font-size:11px;color:var(--muted);cursor:pointer;margin:0 10px;">
+    <input type="checkbox" id="autoRefreshToggle" checked> Auto-refresh
+  </label>
+  <div id="staleLogWarning">⚠️ Logs appear to be stale!</div>
+  <button id="themeToggle" title="Toggle theme">🌙</button>
 </header>
 
 <div class="grid">
   <div class="card" style="grid-column:1/span 4">
     <div class="alertbar">
-      <div class="alert" id="alert-mail">
-        <span class="title">Mail Flow</span>
-        <span class="badge ok" id="alert-mail-badge">Unknown</span>
-      </div>
-      <div class="alert" id="alert-queue">
-        <span class="title">Queue</span>
-        <span class="badge ok" id="alert-queue-badge">–</span>
-      </div>
-      <div class="alert" id="alert-auth">
-        <span class="title">Auth Security</span>
-        <span class="badge ok" id="alert-auth-badge">–</span>
-      </div>
-      <div class="alert" id="alert-source">
-        <span class="title">Log Source</span>
-        <span class="badge ok" id="alert-source-badge">–</span>
-      </div>
+      <div class="alert" id="alert-mail"><span class="title">Mail Flow</span><span class="badge ok" id="alert-mail-badge">Unknown</span></div>
+      <div class="alert" id="alert-queue"><span class="title">Queue</span><span class="badge ok" id="alert-queue-badge">–</span></div>
+      <div class="alert" id="alert-auth"><span class="title">Auth Security</span><span class="badge ok" id="alert-auth-badge">–</span></div>
+      <div class="alert" id="alert-source"><span class="title">Log Source</span><span class="badge ok" id="alert-source-badge">–</span></div>
     </div>
   </div>
 
@@ -594,6 +586,8 @@ table.mini-table tr:last-child td{border-bottom:0}
       <div class="kpi"><div class="v" id="sent">–</div><div class="l">Sent</div></div>
       <div class="kpi"><div class="v" id="failed_delivery">–</div><div class="l">Failed</div></div>
       <div class="kpi"><div class="v" id="rejected">–</div><div class="l">Rejected</div></div>
+      <div class="kpi"><div class="v" id="greylisted">–</div><div class="l">Greylisted</div></div>
+      <div class="kpi"><div class="v" id="rbl_reject">–</div><div class="l">RBL Block</div></div>
       <div class="kpi"><div class="v" id="spam_virus">–</div><div class="l">Spam/Virus</div></div>
       <div class="kpi"><div class="v" id="quota_fail">–</div><div class="l">Quota</div></div>
       <div class="kpi"><div class="v" id="authfail">–</div><div class="l">Auth Fail</div></div>
@@ -706,70 +700,77 @@ table.mini-table tr:last-child td{border-bottom:0}
 
 </div>
 
-<div class="footer">Updated: <span id="updated">–</span> · <a href="?api=health" target="_blank" style="color:#4cc9f0">health</a> · <a href="?api=source" target="_blank" style="color:#4cc9f0">source</a></div>
+<div class="footer">Updated: <span id="updated">–</span> · <a href="?api=health" target="_blank" style="color:var(--accent)">health</a> · <a href="?api=source" target="_blank" style="color:var(--accent)">source</a></div>
 
 <script>
 const $=id=>document.getElementById(id);
-async function j(api){ const r = await fetch('?api='+api,{cache:'no-store'}); return r.json(); }
+let config = {};
+let intervals = {};
+let charts = {};
 
-Chart.defaults.color='#9aa6b2';
-Chart.defaults.borderColor='#1a1f29';
+/* fetch helper */
+async function j(api){ const r = await fetch('?api='+api,{cache:'no-store'}); if (!r.ok) throw new Error(`API fetch failed for ${api}`); return r.json(); }
 
-function makeLine(ctx,labels,datasets){
-  return new Chart(ctx,{type:'line',data:{labels,datasets},options:{
-    responsive:true,maintainAspectRatio:false,
-    plugins:{legend:{labels:{color:'#e6edf3',font:{size:10}}}},
-    elements:{line:{tension:.3}},
-    scales:{x:{ticks:{font:{size:9}}},y:{beginAtZero:true,ticks:{font:{size:9}}}}
-  }});
-}
-function makeBar(ctx,labels,datasets){
-  return new Chart(ctx,{type:'bar',data:{labels,datasets},options:{
-    responsive:true,maintainAspectRatio:false,
-    plugins:{legend:{labels:{color:'#e6edf3',font:{size:10}}}},
-    scales:{x:{stacked:true,ticks:{font:{size:9}}},y:{stacked:true,beginAtZero:true,ticks:{font:{size:9}}}}
-  }});
-}
-function makePie(ctx,labels,data,colors){
-  return new Chart(ctx,{type:'doughnut',data:{labels,datasets:[{data,backgroundColor:colors}]},options:{
-    responsive:true,maintainAspectRatio:false,
-    plugins:{legend:{labels:{color:'#e6edf3',font:{size:10}}}}
-  }});
-}
-function ds(label,data,color){return{label,data,borderColor:color,backgroundColor:color+'33',borderWidth:2,fill:false,tension:.3};}
-
-let charts={};
+/* badges */
 function setBadge(el,level,text){ el.className='badge ' + (level==='ok'?'ok':level==='warn'?'warn':'err'); el.textContent=text; }
 
+/* === CSS var reader and Chart.js theming === */
+const cssVar = (name) => getComputedStyle(document.body).getPropertyValue(name).trim();
+
+function applyChartTheme(){
+  const tick = cssVar('--chart-ticks');
+  const grid = cssVar('--chart-grid');
+
+  // global defaults for new charts
+  Chart.defaults.color = tick;
+  Chart.defaults.borderColor = grid;
+
+  // update existing charts
+  Object.values(charts).forEach(ch=>{
+    if (!ch) return;
+    if (ch.options.plugins?.legend?.labels) ch.options.plugins.legend.labels.color = tick;
+    if (ch.options.scales){
+      for (const ax of Object.values(ch.options.scales)){
+        if (ax.ticks) ax.ticks.color = tick;
+        if (ax.grid)  ax.grid.color  = grid;
+      }
+    }
+    ch.update('none');
+  });
+}
+
+/* ======= API refreshers ======= */
 async function refreshHealth(){
   try{
     const h = await j('health');
     const src = h.source || {};
-    const files = (h.readable_files||[]).join(', ');
     $('diag-source').textContent = src.glob || 'journal';
-    $('diag-files').textContent = files || '–';
+    $('diag-files').textContent = (h.readable_files||[]).join(', ') || '–';
     $('diag-recent').textContent = h.recent_60s_rows ?? '–';
     $('diag-bins').textContent = Object.entries(h.bins_present||{}).map(([k,v])=>k+':' + (v?'✓':'×')).join(' ');
     $('diag-note').textContent = h.note || '–';
-    const warnList = (h.warnings||[]).filter(Boolean).map(w=>'<li>'+w+'</li>').join('');
-    $('diag-warn').innerHTML = warnList || '<li style="color:#9ae6b4">no warnings</li>';
+    $('diag-warn').innerHTML = (h.warnings||[]).filter(Boolean).map(w=>'<li>'+w+'</li>').join('') || '<li style="color:var(--ok)">no warnings</li>';
+    if ((h.readable_files||[]).length>0) setBadge($('alert-source-badge'),'ok','files');
+    else setBadge($('alert-source-badge'),'warn','journal');
 
-    const srcBadge = $('alert-source-badge');
-    if ((h.readable_files||[]).length>0) setBadge(srcBadge,'ok','files');
-    else setBadge(srcBadge,'warn','journal');
+    const staleLogThreshold = (config.thresholds?.stale_log_minutes || 15) * 60;
+    const lastLogTs = h.last_log_update_ts || 0;
+    const nowTs = Date.now() / 1000;
+    $('staleLogWarning').style.display = (lastLogTs > 0 && (nowTs - lastLogTs > staleLogThreshold)) ? 'block' : 'none';
   }catch(e){console.error(e);}
 }
 
 async function refreshKPIs(){
   try{
-    const [today, queue, sessions, totals, system] = await Promise.all([
-      j('today'), j('queue'), j('sessions'), j('totals'), j('system')
-    ]);
+    const [today, queue, sessions, system] = await Promise.all([j('today'), j('queue'), j('sessions'), j('system')]);
+
     $('date').textContent = today.date;
     $('incoming').textContent = today.incoming;
     $('sent').textContent = today.sent;
     $('failed_delivery').textContent = today.failed_delivery;
     $('rejected').textContent = today.rejected;
+    $('greylisted').textContent = today.greylisted;
+    $('rbl_reject').textContent = today.rbl_reject;
     $('spam_virus').textContent = today.spam_virus;
     $('quota_fail').textContent = today.quota_fail;
     $('authfail').textContent = today.auth_fail;
@@ -777,12 +778,12 @@ async function refreshKPIs(){
 
     $('q_total').textContent = queue.total ?? '–';
     $('q_deferred').textContent = queue.deferred ?? '–';
-    const badge = $('q_status');
+    const qBadge = $('q_status');
     if (queue.ok) {
-      const t = queue.total || 0;
-      badge.textContent = (t===0)?'Empty':(t<20?'Low':(t<200?'Moderate':'High'));
-      badge.className = 'badge ' + (t===0?'ok':(t<200?'warn':'err'));
-    } else { badge.textContent='Error'; badge.className='badge err'; }
+      const t = queue.total || 0, high = config.thresholds?.queue_high || 200, warn = config.thresholds?.queue_warn || 20;
+      qBadge.textContent = (t === 0) ? 'Empty' : (t < warn ? 'Low' : (t < high ? 'Moderate' : 'High'));
+      qBadge.className = 'badge ' + (t === 0 ? 'ok' : (t < high ? 'warn' : 'err'));
+    } else { qBadge.textContent='Error'; qBadge.className='badge err'; }
 
     $('imap').textContent = sessions.imap ?? '–';
     $('pop3').textContent = sessions.pop3 ?? '–';
@@ -795,26 +796,22 @@ async function refreshKPIs(){
     $('disk').textContent = `${d.used ?? '?'} / ${d.size ?? '?'} (${d.usep ?? '?'})`;
     $('host').textContent = system.host ?? '–';
 
-    const mailBadge = $('alert-mail-badge');
-    const authBadge = $('alert-auth-badge');
-    const queueBadge = $('alert-queue-badge');
-
     const fail = (today.failed_delivery||0) + (today.rejected||0) + (today.spam_virus||0);
     const inc  = (today.incoming||0) || 1;
     const fr   = fail / inc;
-    if (fr < 0.05) setBadge(mailBadge,'ok','OK');
-    else if (fr < 0.15) setBadge(mailBadge,'warn','Warn');
-    else setBadge(mailBadge,'err','Incident');
+    if (fr < 0.05) setBadge($('alert-mail-badge'),'ok','OK');
+    else if (fr < 0.15) setBadge($('alert-mail-badge'),'warn','Warn');
+    else setBadge($('alert-mail-badge'),'err','Incident');
 
-    const af = today.auth_fail||0;
-    if (af < 50) setBadge(authBadge,'ok','Calm');
-    else if (af < 300) setBadge(authBadge,'warn','Noisy');
-    else setBadge(authBadge,'err','Attack?');
+    const af = today.auth_fail||0, af_warn = config.thresholds?.auth_fail_warn || 50, af_att = config.thresholds?.auth_fail_attack || 300;
+    if (af < af_warn) setBadge($('alert-auth-badge'),'ok','Calm');
+    else if (af < af_att) setBadge($('alert-auth-badge'),'warn','Noisy');
+    else setBadge($('alert-auth-badge'),'err','Attack?');
 
-    const qt = queue.total||0;
-    if (qt===0) setBadge(queueBadge,'ok','Empty');
-    else if (qt<200) setBadge(queueBadge,'warn',String(qt));
-    else setBadge(queueBadge,'err',String(qt));
+    const qt = queue.total||0, qt_high = config.thresholds?.queue_high || 200;
+    if (qt===0) setBadge($('alert-queue-badge'),'ok','Empty');
+    else if (qt < qt_high) setBadge($('alert-queue-badge'),'warn',String(qt));
+    else setBadge($('alert-queue-badge'),'err',String(qt));
 
     $('updated').textContent = new Date().toLocaleTimeString('en-US');
   }catch(e){console.error(e);}
@@ -822,19 +819,15 @@ async function refreshKPIs(){
 
 async function refreshCharts(){
   try{
-    const [live, day, week, month, todayKpis] = await Promise.all([
-      j('series_live'), j('series_today'), j('series_week'), j('series_month'), j('today')
-    ]);
+    const [live, day, week, month, todayKpis] = await Promise.all([j('series_live'), j('series_today'), j('series_week'), j('series_month'), j('today')]);
 
-    const liveDs = [
-      ds('Incoming', live.incoming, '#4cc9f0'),
-      ds('Sent', live.sent, '#90ee90'),
-      ds('Failed', live.failed_delivery, '#ef476f'),
-      ds('Quota', live.quota_fail, '#fb923c'),
-      ds('Rejected', live.rejected, '#ffd166'),
-      ds('Spam/Virus', live.spam_virus, '#a78bfa'),
-      ds('Auth Fail', live.auth_fail, '#f472b6'),
-    ];
+    const liveDs = [ ds('Incoming', live.incoming, '#4cc9f0'),
+                     ds('Sent',     live.sent,     '#90ee90'),
+                     ds('Failed',   live.failed_delivery, '#ef476f'),
+                     ds('Quota',    live.quota_fail, '#fb923c'),
+                     ds('Rejected', live.rejected, '#ffd166'),
+                     ds('Spam/Virus', live.spam_virus, '#a78bfa'),
+                     ds('Auth Fail', live.auth_fail, '#f472b6') ];
     if(!charts.live){ charts.live = makeLine($('liveChart'), live.labels, liveDs); }
     else { charts.live.data.labels=live.labels; charts.live.data.datasets.forEach((d,i)=>d.data=liveDs[i].data); charts.live.update('none'); }
 
@@ -860,80 +853,139 @@ async function refreshCharts(){
     if(!charts.week){ charts.week = makeBar($('weekChart'), week.labels, weekDs); }
     else { charts.week.data.labels=week.labels; charts.week.data.datasets.forEach((d,i)=>d.data=weekDs[i].data); charts.week.update('none'); }
 
-    const monthDs = [
-      ds('Incoming', month.incoming, '#4cc9f0'),
-      ds('Sent', month.sent, '#90ee90'),
-      ds('Failed', month.failed, '#ef476f'),
-    ];
+    const monthDs = [ ds('Incoming', month.incoming, '#4cc9f0'),
+                      ds('Sent',     month.sent,     '#90ee90'),
+                      ds('Failed',   month.failed,   '#ef476f') ];
     if(!charts.month){ charts.month = makeLine($('monthChart'), month.labels, monthDs); }
     else { charts.month.data.labels=month.labels; charts.month.data.datasets.forEach((d,i)=>d.data=monthDs[i].data); charts.month.update('none'); }
 
     const pieTodayData=[todayKpis.incoming,todayKpis.sent,todayKpis.failed_delivery,todayKpis.rejected,todayKpis.spam_virus];
     const pieTodayLabels=['Incoming','Sent','Failed','Rejected','Spam/Virus'];
     const pieTodayColors=['#4cc9f0','#90ee90','#ef476f','#ffd166','#a78bfa'];
+    if(!charts.pieToday){ charts.pieToday = makePie($('pieToday'), pieTodayLabels, pieTodayData, pieTodayColors); }
+    else { charts.pieToday.data.datasets[0].data = pieTodayData; charts.pieToday.update('none'); }
 
     const pieErrData=[todayKpis.rejected,todayKpis.spam_virus,todayKpis.quota_fail,todayKpis.auth_fail];
     const pieErrLabels=['Rejected','Spam/Virus','Quota/Full','Auth Fail'];
     const pieErrColors=['#ffd166','#a78bfa','#fb923c','#f472b6'];
-
-    if(!charts.pieToday){ charts.pieToday = makePie($('pieToday'), pieTodayLabels, pieTodayData, pieTodayColors); }
-    else { charts.pieToday.data.datasets[0].data = pieTodayData; charts.pieToday.update('none'); }
-
     if(!charts.pieErrors){ charts.pieErrors = makePie($('pieErrors'), pieErrLabels, pieErrData, pieErrColors); }
     else { charts.pieErrors.data.datasets[0].data = pieErrData; charts.pieErrors.update('none'); }
 
+    // reapply theme to ensure grid/ticks use computed colors
+    applyChartTheme();
   }catch(e){ console.error(e); }
 }
 
-// NEW FUNCTION to refresh top talkers tables
+/* Top talkers tables */
 async function refreshTopTalkers() {
-    try {
-        const [day, week, month] = await Promise.all([
-            j('top_day'), j('top_week'), j('top_month')
-        ]);
-
-        const populateTable = (tbodyId, data) => {
-            const tbody = $(tbodyId);
-            tbody.innerHTML = '';
-            if (Object.keys(data).length === 0) {
-                tbody.innerHTML = '<tr><td colspan="2" style="text-align:center;color:var(--muted);">No data</td></tr>';
-                return;
-            }
-            for (const [email, count] of Object.entries(data)) {
-                const tr = document.createElement('tr');
-                const tdEmail = document.createElement('td');
-                tdEmail.textContent = email;
-                const tdCount = document.createElement('td');
-                tdCount.textContent = count;
-                tr.appendChild(tdEmail);
-                tr.appendChild(tdCount);
-                tbody.appendChild(tr);
-            }
-        };
-
-        populateTable('top-senders-day', day.senders);
-        populateTable('top-recipients-day', day.recipients);
-
-        populateTable('top-senders-week', week.senders);
-        populateTable('top-recipients-week', week.recipients);
-
-        populateTable('top-senders-month', month.senders);
-        populateTable('top-recipients-month', month.recipients);
-
-    } catch(e) { console.error('Error refreshing top talkers:', e); }
+  try {
+    const [day, week, month] = await Promise.all([j('top_day'), j('top_week'), j('top_month')]);
+    const fill = (tbodyId, data) => {
+      const tbody = $(tbodyId);
+      tbody.innerHTML = '';
+      if (Object.keys(data).length === 0) {
+        tbody.innerHTML = '<tr><td colspan="2" style="text-align:center;color:var(--muted);">No data</td></tr>';
+        return;
+      }
+      for (const [email, count] of Object.entries(data)) {
+        const tr = document.createElement('tr');
+        const tdEmail = document.createElement('td'); tdEmail.textContent = email;
+        const tdCount = document.createElement('td'); tdCount.textContent = count;
+        tr.appendChild(tdEmail); tr.appendChild(tdCount);
+        tbody.appendChild(tr);
+      }
+    };
+    fill('top-senders-day', day.senders); fill('top-recipients-day', day.recipients);
+    fill('top-senders-week', week.senders); fill('top-recipients-week', week.recipients);
+    fill('top-senders-month', month.senders); fill('top-recipients-month', month.recipients);
+  } catch(e) { console.error('Error refreshing top talkers:', e); }
 }
 
-// Initial calls
-refreshHealth();
-refreshKPIs();
-refreshCharts();
-refreshTopTalkers(); // New initial call
+/* ======= Chart builders use computed colors ======= */
+function makeLine(ctx,labels,datasets){
+  const tick = cssVar('--chart-ticks');
+  const grid = cssVar('--chart-grid');
+  return new Chart(ctx,{
+    type:'line',
+    data:{labels,datasets},
+    options:{
+      responsive:true,maintainAspectRatio:false,
+      plugins:{legend:{labels:{color:tick,font:{size:10}}}},
+      elements:{line:{tension:.3}},
+      scales:{
+        x:{ticks:{font:{size:9},color:tick},grid:{color:grid}},
+        y:{beginAtZero:true,ticks:{font:{size:9},color:tick},grid:{color:grid}}
+      }
+    }
+  });
+}
+function makeBar(ctx,labels,datasets){
+  const tick = cssVar('--chart-ticks');
+  const grid = cssVar('--chart-grid');
+  return new Chart(ctx,{
+    type:'bar',
+    data:{labels,datasets},
+    options:{
+      responsive:true,maintainAspectRatio:false,
+      plugins:{legend:{labels:{color:tick,font:{size:10}}}},
+      scales:{
+        x:{stacked:true,ticks:{font:{size:9},color:tick},grid:{color:grid}},
+        y:{stacked:true,beginAtZero:true,ticks:{font:{size:9},color:tick},grid:{color:grid}}
+      }
+    }
+  });
+}
+function makePie(ctx,labels,data,colors){
+  const tick = cssVar('--chart-ticks');
+  return new Chart(ctx,{
+    type:'doughnut',
+    data:{labels,datasets:[{data,backgroundColor:colors}]},
+    options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{position:'right',labels:{color:tick,font:{size:10}}}}}
+  });
+}
+function ds(label,data,color){return{label,data,borderColor:color,backgroundColor:color+'33',borderWidth:2,fill:false,tension:.3};}
 
-// Intervals
-setInterval(refreshHealth, 15000);
-setInterval(refreshKPIs, 5000);
-setInterval(refreshCharts, 30000);
-setInterval(refreshTopTalkers, 60000); // New interval, e.g. every minute
+/* intervals */
+function stopIntervals(){ for (const k in intervals) clearInterval(intervals[k]); }
+function startIntervals(){
+  stopIntervals();
+  intervals.health = setInterval(refreshHealth, 15000);
+  intervals.kpis   = setInterval(refreshKPIs, 5000);
+  intervals.charts = setInterval(refreshCharts, 30000);
+  intervals.talkers= setInterval(refreshTopTalkers, 60000);
+}
+
+/* init */
+async function initializeDashboard() {
+  try { config = await j('config'); } catch (e) { console.error('Failed to load initial config.', e); }
+
+  const themeToggle = $('themeToggle');
+  const prefersDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
+  let currentTheme = localStorage.getItem('theme') || (prefersDark ? 'dark' : 'light');
+  if (currentTheme === 'light') { document.body.classList.add('light-theme'); themeToggle.textContent = '☀️'; }
+
+  themeToggle.addEventListener('click', () => {
+    document.body.classList.toggle('light-theme');
+    const isLight = document.body.classList.contains('light-theme');
+    localStorage.setItem('theme', isLight ? 'light' : 'dark');
+    themeToggle.textContent = isLight ? '☀️' : '🌙';
+    applyChartTheme(); // recolor charts on theme change
+  });
+
+  $('autoRefreshToggle').addEventListener('change', (e) => {
+    if (e.target.checked) {
+      refreshHealth(); refreshKPIs(); refreshCharts(); refreshTopTalkers();
+      startIntervals();
+    } else {
+      stopIntervals();
+    }
+  });
+
+  // first load
+  refreshHealth(); refreshKPIs(); refreshCharts(); refreshTopTalkers();
+  startIntervals();
+}
+initializeDashboard();
 </script>
 </body>
 </html>
